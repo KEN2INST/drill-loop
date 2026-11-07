@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>ドリル区間リピート再生</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif;
+         background: #151515; color: #eee; }
+  main { max-width: 960px; margin: 0 auto; padding: 12px; }
+  .frame { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+  .frame iframe, .frame #player { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .status { margin: 10px 0 4px; font-size: 14px; color: #bbb; min-height: 1.4em; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+  .row > .label { min-width: 5.5em; color: #aaa; font-size: 13px; }
+  button, select { font: inherit; font-size: 14px; padding: 7px 12px; border-radius: 6px;
+                   border: 1px solid #444; background: #262626; color: #eee; cursor: pointer; }
+  button:hover, select:hover { background: #333; }
+  button.on { background: #2f6fed; border-color: #2f6fed; }
+  .time { font-variant-numeric: tabular-nums; min-width: 4.5em; text-align: center; }
+  .error { background: #4a1f1f; border: 1px solid #8a3a3a; padding: 10px 12px; border-radius: 6px; margin: 10px 0; display: none; }
+  a { color: #7db0ff; }
+  small { color: #888; }
+</style>
+</head>
+<body>
+<main>
+  <div class="frame"><div id="player"></div></div>
+  <div id="error" class="error"></div>
+  <div class="status" id="status">読み込み中…</div>
+
+  <div class="row">
+    <span class="label">速度</span>
+    <span id="speeds"></span>
+  </div>
+  <div class="row">
+    <span class="label">繰り返し</span>
+    <select id="loops">
+      <option value="0">無制限</option>
+      <option value="3">3回</option>
+      <option value="5">5回</option>
+      <option value="10">10回</option>
+    </select>
+  </div>
+  <div class="row">
+    <span class="label">開始位置</span>
+    <button data-nudge="s:-1">−1秒</button>
+    <span class="time" id="sval">0</span>
+    <button data-nudge="s:1">+1秒</button>
+    <button id="setStart">今の位置を開始に</button>
+  </div>
+  <div class="row">
+    <span class="label">終了位置</span>
+    <button data-nudge="e:-1">−1秒</button>
+    <span class="time" id="eval">0</span>
+    <button data-nudge="e:1">+1秒</button>
+    <button id="setEnd">今の位置を終了に</button>
+  </div>
+  <div class="row">
+    <button id="restart">最初から</button>
+    <button id="copy">この区間のURLをコピー</button>
+    <a id="yt" target="_blank" rel="noopener">YouTubeで開く</a>
+  </div>
+  <small>開始・終了位置を調整してURLをコピーすると、調整後の区間を共有できます。Notionの開始秒・終了秒は自動では変わりません。</small>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- URLパラメータ ----
+  var q = new URLSearchParams(location.search);
+  var vid = q.get("v") || "";
+  var start = Math.max(0, parseFloat(q.get("s")) || 0);
+  var end = Math.max(0, parseFloat(q.get("e")) || 0);          // 0 = 動画の最後まで
+  var rate = parseFloat(q.get("r")) || 1;
+  var maxLoops = parseInt(q.get("n"), 10) || 0;                // 0 = 無制限
+
+  var $ = function (id) { return document.getElementById(id); };
+  var statusEl = $("status"), errEl = $("error");
+
+  function showError(html) { errEl.style.display = "block"; errEl.innerHTML = html; }
+  function fmt(sec) {
+    sec = Math.max(0, Math.round(sec));
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  if (!/^[A-Za-z0-9_-]{11}$/.test(vid)) {
+    statusEl.textContent = "";
+    showError("動画IDが指定されていません。URLの形式: <code>?v=動画ID&amp;s=開始秒&amp;e=終了秒</code>");
+    return;
+  }
+
+  // ---- 繰り返し判定(純粋関数) ----
+  // state: "playing" / "ended" など。戻り値: "seek"(開始位置へ戻す) / "stop"(回数到達) / "none"
+  function nextAction(state, t, s, e, loopsDone, limit) {
+    var reachedEnd = (state === "ended") || (state === "playing" && e > 0 && t >= e - 0.12);
+    if (!reachedEnd) return "none";
+    if (limit > 0 && loopsDone + 1 >= limit) return "stop";
+    return "seek";
+  }
+  window.__nextAction = nextAction;  // テスト用
+
+  var player, loopsDone = 0, timer = null;
+
+  function link() {
+    var p = new URLSearchParams();
+    p.set("v", vid); p.set("s", String(Math.round(start)));
+    if (end > 0) p.set("e", String(Math.round(end)));
+    if (rate !== 1) p.set("r", String(rate));
+    if (maxLoops > 0) p.set("n", String(maxLoops));
+    return location.origin + location.pathname + "?" + p.toString();
+  }
+  function render() {
+    $("sval").textContent = fmt(start);
+    $("eval").textContent = end > 0 ? fmt(end) : "最後まで";
+    $("yt").href = "https://www.youtube.com/watch?v=" + vid + "&t=" + Math.round(start) + "s";
+    $("loops").value = String(maxLoops);
+    var label = (end > 0 ? fmt(start) + " – " + fmt(end) : fmt(start) + " から最後まで");
+    statusEl.textContent = "区間 " + label + "  /  " + (loopsDone + 1) + "回目" +
+                           (maxLoops > 0 ? " / " + maxLoops + "回" : "") + "  /  " + rate + "倍速";
+  }
+
+  // ---- 速度ボタン ----
+  [0.25, 0.5, 0.75, 1].forEach(function (r) {
+    var b = document.createElement("button");
+    b.textContent = r + "倍";
+    b.dataset.rate = String(r);
+    b.addEventListener("click", function () { setRate(r); });
+    $("speeds").appendChild(b);
+  });
+  function setRate(r) {
+    rate = r;
+    if (player && player.setPlaybackRate) player.setPlaybackRate(r);
+    Array.prototype.forEach.call($("speeds").children, function (b) {
+      b.classList.toggle("on", parseFloat(b.dataset.rate) === r);
+    });
+    render();
+  }
+
+  function restart() { loopsDone = 0; player.seekTo(start, true); player.playVideo(); render(); }
+
+  // ---- YouTube IFrame API ----
+  var tag = document.createElement("script");
+  tag.src = "https://www.youtube.com/iframe_api";
+  document.head.appendChild(tag);
+
+  window.onYouTubeIframeAPIReady = function () {
+    player = new YT.Player("player", {
+      videoId: vid,
+      playerVars: { start: Math.floor(start), autoplay: 1, playsinline: 1, rel: 0, modestbranding: 1 },
+      events: {
+        onReady: function () { setRate(rate); render(); player.playVideo(); startTimer(); },
+        onStateChange: function (ev) {
+          if (ev.data === YT.PlayerState.ENDED) tick("ended");
+        },
+        onError: function (ev) {
+          var code = ev.data;
+          var msg = (code === 101 || code === 150)
+            ? "この動画は投稿者の設定により、埋め込み再生できません。"
+            : "動画を再生できませんでした(エラー " + code + ")。";
+          showError(msg + ' <a target="_blank" rel="noopener" href="' +
+                    "https://www.youtube.com/watch?v=" + vid + "&t=" + Math.round(start) + 's">YouTubeで開く</a>');
+        }
+      }
+    });
+  };
+
+  function tick(forcedState) {
+    if (!player || !player.getCurrentTime) return;
+    var st = forcedState || (player.getPlayerState() === 1 ? "playing" : "other");
+    var act = nextAction(st, player.getCurrentTime(), start, end, loopsDone, maxLoops);
+    if (act === "seek") {
+      loopsDone += 1;
+      player.seekTo(start, true);
+      if (st === "ended") player.playVideo();
+      render();
+    } else if (act === "stop") {
+      loopsDone += 1;
+      player.pauseVideo();
+      player.seekTo(start, true);
+      statusEl.textContent = "指定回数(" + maxLoops + "回)の再生が終わりました。";
+    }
+  }
+  function startTimer() { if (!timer) timer = setInterval(function () { tick(); }, 100); }
+
+  // ---- 操作 ----
+  document.addEventListener("click", function (ev) {
+    var n = ev.target && ev.target.dataset && ev.target.dataset.nudge;
+    if (!n) return;
+    var parts = n.split(":"), which = parts[0], d = parseInt(parts[1], 10);
+    if (which === "s") start = Math.max(0, start + d);
+    else end = Math.max(0, (end || start + 1) + d);
+    if (end > 0 && end <= start) { if (which === "s") start = Math.max(0, end - 1); else end = start + 1; }
+    render();
+    if (which === "s" && player) { loopsDone = 0; player.seekTo(start, true); }
+  });
+  $("setStart").addEventListener("click", function () {
+    if (!player) return; start = Math.floor(player.getCurrentTime());
+    if (end > 0 && end <= start) end = 0; render();
+  });
+  $("setEnd").addEventListener("click", function () {
+    if (!player) return; var t = Math.ceil(player.getCurrentTime());
+    if (t > start) end = t; render();
+  });
+  $("loops").addEventListener("change", function (e) { maxLoops = parseInt(e.target.value, 10) || 0; loopsDone = 0; render(); });
+  $("restart").addEventListener("click", function () { if (player) restart(); });
+  $("copy").addEventListener("click", function () {
+    var url = link(), b = $("copy");
+    (navigator.clipboard ? navigator.clipboard.writeText(url) : Promise.reject()).then(function () {
+      b.textContent = "コピーしました";
+    }, function () { window.prompt("URLをコピーしてください", url); });
+    setTimeout(function () { b.textContent = "この区間のURLをコピー"; }, 1800);
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
